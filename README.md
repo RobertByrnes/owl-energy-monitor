@@ -30,9 +30,13 @@ home network and shows what your house is using right now.
   time the last packet arrived. After 3 minutes of silence it reads `No data since hh:mm:ss`,
   and it shows `WIFI LOST` if the connection drops.
 - **Updates over WiFi (OTA):** password protected, with a progress bar on the screen.
-- **Optional:** post the readings to your own web server (off by default).
+- **Safe by default:** only packets sent to the OWL's multicast group are used, and a packet with an
+  impossible-looking value is ignored whole (see "How it works").
 
 Only the parts of the screen that change are redrawn, so it doesn't flicker.
+
+Forwarding the readings to your own web server isn't part of the sketch, but
+[README_HTTP_POST.md](README_HTTP_POST.md) has the code and steps to add it as an extra.
 
 ## What you need
 
@@ -50,7 +54,8 @@ Tested with: **arduino-esp32 3.3.12**, **Adafruit GFX Library 1.13.0**, **MCUFRI
 ```
 OWL_Display/
 ├── README.md
-├── .gitignore
+├── README_HTTP_POST.md         optional extra: send the readings to your own server
+├── .gitignore                  keeps config.h, backups and keys out of git
 ├── config.example.h            template for your private settings
 └── owl_energy_display/         the Arduino sketch
     ├── owl_energy_display.ino  the program
@@ -75,7 +80,7 @@ Open **Tools → Manage Libraries** and install:
 - **Adafruit GFX Library** (say yes to installing *Adafruit BusIO* when asked)
 - **MCUFRIEND_kbv** (by David Prentice)
 
-`WiFi`, `AsyncUDP`, `ArduinoOTA`, `HTTPClient`, `ESPmDNS` and `Update` all come with the ESP32
+`WiFi`, `AsyncUDP`, `ArduinoOTA`, `ESPmDNS` and `Update` all come with the ESP32
 board support, so don't install anything for those. The font header `FreeDefaultFonts.h`
 comes with MCUFRIEND_kbv.
 
@@ -111,7 +116,9 @@ cp config.example.h owl_energy_display/config.h          (macOS / Linux)
 |---------|---------|
 | `ssid`, `password` | Your 2.4 GHz WiFi name and password. |
 | `otaPasswordHash` | The **SHA-256 hash** of your OTA password (64 hex characters), not the password itself. See "Making the OTA password hash" below. If it is missing or malformed, OTA stays switched off and Serial says why. |
-| `serverName`, `apiKeyValue` | Only used if you turn on `ENABLE_HTTP_POST`. Leave the example values otherwise. |
+
+Older versions of the sketch also read `serverName` and `apiKeyValue` from this file. Nothing uses
+them any more, so you can delete them from an old `config.h`.
 
 #### Making the OTA password hash
 
@@ -175,8 +182,8 @@ The options at the top of `owl_energy_display.ino` are the ones you'll most like
 | Setting | Default | What it does |
 |---------|---------|--------------|
 | `ENABLE_OTA` | `1` | Allow password-protected updates over WiFi. |
-| `ENABLE_HTTP_POST` | `0` | Send the readings to `serverName` every 3 minutes (form fields `api_key`, `watts`, `kwHours`, `nowCost`, `dayCost`). Plain HTTP, so only use it on a network you trust. |
 | `DEBUG_SERIAL` | `1` | Print every packet and parsed value to Serial. Set to `0` once it's working. |
+| `MAX_WATTS` and the other `MAX_` limits | 25,000 W, 600,000 Wh, £50/hr, £1,000/day | The biggest readings the sketch believes. A packet with anything beyond them is ignored. They are generous on purpose; raise `MAX_WATTS` if your supply really is bigger than about 23 kW. |
 | `METER_MAX_WATTS` | `3500` | Full scale of the dial. Lower it to make the dial go red sooner. |
 | `METER_GHOST` | `45` | Brightness (0-255) of the unlit part of the dial. |
 | `HEAT_STOPS` | blue → red | The colours of the dial and where each one sits. |
@@ -188,12 +195,17 @@ The options at the top of `owl_energy_display.ino` are the ones you'll most like
 ## How it works
 
 1. The ESP32 joins the OWL's multicast group and receives each packet as it is sent.
-2. The packet handler only copies the packet into a small queue. `loop()` then reads it
-   and updates the values: watts, kWh, battery, and cost (the sketch treats the OWL's cost
-   figures as pence and shows them as pounds).
+2. The packet handler throws away anything that wasn't sent to that group, such as packets
+   aimed straight at the board. It then copies the rest into a small queue.
+3. `loop()` reads each packet and updates the values: watts, kWh, battery, and cost (the sketch
+   treats the OWL's cost figures as pence and shows them as pounds).
    A packet that lacks a field leaves the old value alone.
-3. The display redraws only what changed.
-4. If WiFi drops, the board rejoins the multicast group automatically when it's back.
+4. Every number is checked first. If any value in a packet isn't a real number, or is beyond
+   the `MAX_` limits, the whole packet is ignored: the readings don't change, and it doesn't
+   count as having heard from the OWL, so a stream of bad packets can't keep the display
+   looking alive.
+5. The display redraws only what changed.
+6. If WiFi drops, the board rejoins the multicast group automatically when it's back.
 
 ### Screen colours
 
@@ -210,29 +222,35 @@ send `~colour565`.
 | `'otaPasswordHash' was not declared` | Your `config.h` is missing or out of date. Copy it again from `config.example.h` and fill it in. |
 | Serial says `OTA disabled: otaPasswordHash ...` | The value must be exactly 64 hex characters, the SHA-256 of your password, and not the hash of an empty password. |
 | The IDE says the OTA password is wrong | Type the original password, not the hash. If it still fails, remake the hash and check the password had no stray space or newline. |
-| `Multiple libraries were found for "HTTPClient.h"`, or odd errors from it | An old copy of `HTTPClient` in `Documents\Arduino\libraries` is hiding the ESP32 one. Remove or rename that folder. |
 | Errors about `ArduinoOTA`, such as `setHostname`, or the build says it is using `Documents\Arduino\libraries\ArduinoOTA` | That folder is a different library, for SAMD and Uno R4 boards, and it is hiding the ESP32 one. Move it aside for ESP32 builds. |
 | Stays on "Waiting for the OWL to Hoot!" | No packets are arriving. Check the OWL is sending multicast packets on the same network and subnet as the ESP32. Some routers and access points block or throttle multicast (look for IGMP snooping or multicast settings). Serial should show `Listening for OWL packets`. |
-| Bottom-left box says `No data since…` | Nothing has been heard for 3 minutes. Check the OWL and its sensor battery. |
+| Bottom-left box says `No data since…` | Nothing has been heard for 3 minutes. Check the OWL and its sensor battery. Serial may say why: see the next two rows. |
+| Serial says `Ignored a packet not addressed to the OWL group (from 192.168.x.x)` | A packet reached the board that wasn't sent to `224.192.32.19`. If that address is not your OWL, it is something else on your network and can be ignored. If it is your OWL, then either it is using a different multicast group (change `OWL_GROUP` to match) or it is sending straight to the board, which this sketch deliberately doesn't accept. Serial shows this note at most once every 10 seconds. |
+| Serial says `Ignored a packet: watts is not a believable value` (or battery, cost, usage) | That packet was outside the `MAX_` limits or wasn't a number, so it was dropped. If it was your real OWL and your supply is bigger than about 23 kW, raise `MAX_WATTS`. Otherwise it is a corrupt or forged packet and dropping it is correct. |
 | `WIFI LOST` | The board will reconnect by itself. Check the router if it doesn't. |
 | Restarts over and over at "WiFi failed!" | Check `ssid` and `password`, and that you're on 2.4 GHz. |
 
 ## Security notes
 
-- Never commit `config.h`. It's listed in `.gitignore`, and if your sketchbook lives in OneDrive
-  or Dropbox it will sync there too.
+- Never commit `config.h`. `.gitignore` covers it, along with any other `config.*` file except
+  `config.example.h`, plus `*.bak`, `*.orig`, `*.pem` and `*.key`, so a stray backup or key file
+  can't be added by accident. If your sketchbook lives in OneDrive or Dropbox, `config.h` will
+  sync there too.
 - `config.h` keeps only a **hash** of the OTA password. Treat the hash as secret too: with this
-  login scheme, anyone who has the hash could write a tool that logs in. The WiFi password, and
-  `apiKeyValue` if you use HTTP POST, still have to be plain text in `config.h` because the board
-  needs them exactly as they are.
+  login scheme, anyone who has the hash could write a tool that logs in. The WiFi password still
+  has to be plain text in `config.h` because the board needs it exactly as it is.
 - Use a long, random OTA password. Updates are password protected but not encrypted or signed,
   so anyone who has the password (or the hash) and is on your network can load new firmware.
   Don't forward the OTA port to the internet.
-- The OWL's multicast packets aren't signed or authenticated, so there is nothing for the board to
-  check. Another device on your network could send false readings. That only affects what the
-  display shows, so keep the OWL and the ESP32 on a network you trust.
-- `ENABLE_HTTP_POST` sends the API key over plain HTTP. Use it only on a trusted network, or
-  put HTTPS in front of the server.
+- The board only accepts packets sent to the OWL's multicast group, and ignores any packet with a
+  value that isn't a believable number. That stops packets aimed straight at the board, and garbage
+  values, from reaching the screen.
+- The OWL's multicast packets aren't signed or authenticated, so there is nothing more the board can
+  check. Another device on your network that joins the group could still send false but believable
+  readings. That only affects what the display shows, so keep the OWL and the ESP32 on a network
+  you trust.
+- If you add the optional server upload from [README_HTTP_POST.md](README_HTTP_POST.md), it uses HTTPS
+  and checks the server's certificate. Don't switch the certificate check off.
 - Set `DEBUG_SERIAL` to `0` once everything works.
 
 ## Credits
