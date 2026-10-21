@@ -30,6 +30,9 @@ home network and shows what your house is using right now.
   time the last packet arrived. After 3 minutes of silence it reads `No data since hh:mm:ss`,
   and it shows `WIFI LOST` if the connection drops.
 - **Updates over WiFi (OTA):** password protected, with a progress bar on the screen.
+- **Live web console (optional):** browse to `http://<the display's IP>/esp` to watch each reading
+  arrive on a web page. It's built on the [esp_socket](https://github.com/RobertByrnes/esp_socket)
+  library and is read-only (see "Live web console" below).
 - **Safe by default:** only packets sent to the OWL's multicast group are used, and a packet with an
   impossible-looking value is ignored whole (see "How it works").
 
@@ -46,6 +49,7 @@ Forwarding the readings to your own web server isn't part of the sketch, but
 | OWL Intuition energy monitor | Must be sending its multicast packets on the same network as the ESP32. The sketch listens on `224.192.32.19`, port `22600`. |
 | 2.4 GHz WiFi | The ESP32 only does 2.4 GHz. |
 | Arduino IDE 2.x | See below. |
+| Web console libraries (optional) | ESP Async WebServer, Async TCP and ESPSOCKET, installed as in "Install the libraries" below. Not needed if you set `ENABLE_WEB_SOCKET` to `0`. |
 
 Tested with: **arduino-esp32 3.3.12**, **Adafruit GFX Library 1.13.0**, **MCUFRIEND_kbv 3.0.0**.
 
@@ -79,6 +83,14 @@ Open **Tools → Manage Libraries** and install:
 
 - **Adafruit GFX Library** (say yes to installing *Adafruit BusIO* when asked)
 - **MCUFRIEND_kbv** (by David Prentice)
+
+For the live web console, also install these (skip them if you set `ENABLE_WEB_SOCKET` to `0`):
+
+- **ESP Async WebServer** and **Async TCP**, both by **ESP32Async**. Use the ESP32Async versions:
+  the original `me-no-dev` ones are no longer maintained and have build problems on ESP32 core 3.x.
+- **ESPSOCKET** ([esp_socket](https://github.com/RobertByrnes/esp_socket)), which isn't in Library
+  Manager. On its GitHub page choose **Code → Download ZIP**, then in the IDE use
+  **Sketch → Include Library → Add .ZIP Library…**
 
 `WiFi`, `AsyncUDP`, `ArduinoOTA`, `ESPmDNS` and `Update` all come with the ESP32
 board support, so don't install anything for those. The font header `FreeDefaultFonts.h`
@@ -175,6 +187,29 @@ The first upload has to be over USB. After that:
 If the network port doesn't appear, check that your router isn't blocking device-to-device
 traffic (client isolation) and that mDNS is allowed. As a fallback, use USB.
 
+## Live web console (esp_socket)
+
+With `ENABLE_WEB_SOCKET` on (the default), the board also runs a small web server, using the
+[esp_socket](https://github.com/RobertByrnes/esp_socket) library.
+
+1. Find the board's IP address. It's on the screen, in the bottom-left box (which alternates
+   with the time of the last packet).
+2. On a phone or PC on the same network, open `http://<that IP>/esp`. Plain `http://<that IP>/`
+   redirects there too. With OTA on, `http://owl-display.local/esp` also works on systems that
+   support mDNS.
+3. Each reading the OWL sends adds a line to the terminal:
+   ```
+   1234 W | 5.68 kWh today | 1.23 GBP today | 0.28 GBP/hr | OWL battery 85 %
+   ```
+   A packet that is ignored for an impossible value is logged as well. The terminal starts empty
+   and fills as packets arrive. The boxes above it show the WiFi signal, the chip and the OWL
+   sensor's battery, and refresh every 10 seconds.
+
+It is read-only. The page still has the Send button and action list from esp_socket's general
+purpose page, but the sketch gives esp_socket no message handler, so anything a browser sends is
+ignored. The page loads Bootstrap, Google Fonts and Font Awesome from public CDNs, so the browser
+needs internet access for the page to look right. The board itself doesn't need the internet for this.
+
 ## Settings in the sketch
 
 The options at the top of `owl_energy_display.ino` are the ones you'll most likely want to change.
@@ -182,6 +217,7 @@ The options at the top of `owl_energy_display.ino` are the ones you'll most like
 | Setting | Default | What it does |
 |---------|---------|--------------|
 | `ENABLE_OTA` | `1` | Allow password-protected updates over WiFi. |
+| `ENABLE_WEB_SOCKET` | `1` | Serve the read-only live web console (see above). Set to `0` to leave out the web server and the extra libraries. |
 | `DEBUG_SERIAL` | `1` | Print every packet and parsed value to Serial. Set to `0` once it's working. |
 | `MAX_WATTS` and the other `MAX_` limits | 25,000 W, 600,000 Wh, £50/hr, £1,000/day | The biggest readings the sketch believes. A packet with anything beyond them is ignored. They are generous on purpose; raise `MAX_WATTS` if your supply really is bigger than about 23 kW. |
 | `METER_MAX_WATTS` | `3500` | Full scale of the dial. Lower it to make the dial go red sooner. |
@@ -189,6 +225,7 @@ The options at the top of `owl_energy_display.ino` are the ones you'll most like
 | `HEAT_STOPS` | blue → red | The colours of the dial and where each one sits. |
 | `STALE_AFTER_MS` | 3 minutes | Time without a packet before the box says `No data since…`. |
 | `INFO_PAGE_MS` | 5 seconds | How long each page of the bottom-left box shows. |
+| `WEB_STATUS_MS` | 10 seconds | How often the boxes above the web console's terminal refresh. |
 | `TIMEZONE`, `NTP_SERVER` | UK time, `pool.ntp.org` | Clock used for the "last packet" time. Until the clock is set, the box shows `Last packet: 12s ago` instead. |
 | `OTA_HOSTNAME` | `owl-display` | Name the board uses on the network (`owl-display.local`). |
 
@@ -205,7 +242,8 @@ The options at the top of `owl_energy_display.ino` are the ones you'll most like
    count as having heard from the OWL, so a stream of bad packets can't keep the display
    looking alive.
 5. The display redraws only what changed.
-6. If WiFi drops, the board rejoins the multicast group automatically when it's back.
+6. If the web console is on, each accepted packet, and each one that is ignored, is also written to it.
+7. If WiFi drops, the board rejoins the multicast group automatically when it's back.
 
 ### Screen colours
 
@@ -219,6 +257,9 @@ send `~colour565`.
 | Problem | What to do |
 |---------|------------|
 | `'GPIO' was not declared in this scope` | Apply the MCUFRIEND_kbv patch in step 3 above. |
+| `ESPSocket.h: No such file or directory` (or `ESPAsyncWebServer.h`) | Install the web console libraries (see "Install the libraries"), or set `ENABLE_WEB_SOCKET` to `0`. |
+| The build stops with `Sketch too big` or `text section exceeds available space` | The web server makes the program bigger. Choose **Tools → Partition Scheme → Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)**, which keeps OTA working, or set `ENABLE_WEB_SOCKET` to `0`. |
+| The web page won't open, or its terminal stays empty | Use the IP address from the screen with `/esp` on the end, from a device on the same network. The terminal fills as packets arrive, so it stays empty until the OWL sends one. If the page looks unstyled, the browser has no internet access: it fetches its styling from public CDNs. |
 | `'otaPasswordHash' was not declared` | Your `config.h` is missing or out of date. Copy it again from `config.example.h` and fill it in. |
 | Serial says `OTA disabled: otaPasswordHash ...` | The value must be exactly 64 hex characters, the SHA-256 of your password, and not the hash of an empty password. |
 | The IDE says the OTA password is wrong | Type the original password, not the hash. If it still fails, remake the hash and check the password had no stray space or newline. |
@@ -242,6 +283,10 @@ send `~colour565`.
 - Use a long, random OTA password. Updates are password protected but not encrypted or signed,
   so anyone who has the password (or the hash) and is on your network can load new firmware.
   Don't forward the OTA port to the internet.
+- The live web console has **no password** and uses plain HTTP, so anyone on your network can open
+  it and see your electricity use, which shows when you are home. It is read-only and can't change
+  anything on the board, and the sketch only sends numbers and fixed text to it, never text from a
+  packet. Don't forward port 80 to the internet. Set `ENABLE_WEB_SOCKET` to `0` if you don't want it.
 - The board only accepts packets sent to the OWL's multicast group, and ignores any packet with a
   value that isn't a believable number. That stops packets aimed straight at the board, and garbage
   values, from reaching the screen.
@@ -256,5 +301,7 @@ send `~colour565`.
 ## Credits
 
 Built on the [Adafruit GFX Library](https://github.com/adafruit/Adafruit-GFX-Library),
-[MCUFRIEND_kbv](https://github.com/prenticedavid/MCUFRIEND_kbv) by David Prentice, and the
-[arduino-esp32](https://github.com/espressif/arduino-esp32) core.
+[MCUFRIEND_kbv](https://github.com/prenticedavid/MCUFRIEND_kbv) by David Prentice, the
+[arduino-esp32](https://github.com/espressif/arduino-esp32) core and, for the optional web console,
+[esp_socket](https://github.com/RobertByrnes/esp_socket) with the [ESP32Async](https://github.com/ESP32Async)
+web libraries.
