@@ -87,7 +87,9 @@ Open **Tools → Manage Libraries** and install:
 For the live web console, also install these (skip them if you set `ENABLE_WEB_SOCKET` to `0`):
 
 - **ESP Async WebServer** and **Async TCP**, both by **ESP32Async**. Use the ESP32Async versions:
-  the original `me-no-dev` ones are no longer maintained and have build problems on ESP32 core 3.x.
+  older copies, including the original `me-no-dev` ones and ESPAsyncWebServer 3.1.0, don't build on
+  ESP32 core 3.x. If you already have old copies of `ESPAsyncWebServer` or `AsyncTCP` in your
+  `Arduino\libraries` folder, move them out of it first, or the IDE may keep using them.
 - **ESPSOCKET** ([esp_socket](https://github.com/RobertByrnes/esp_socket)), which isn't in Library
   Manager. On its GitHub page choose **Code → Download ZIP**, then in the IDE use
   **Sketch → Include Library → Add .ZIP Library…**
@@ -258,6 +260,7 @@ send `~colour565`.
 |---------|------------|
 | `'GPIO' was not declared in this scope` | Apply the MCUFRIEND_kbv patch in step 3 above. |
 | `ESPSocket.h: No such file or directory` (or `ESPAsyncWebServer.h`) | Install the web console libraries (see "Install the libraries"), or set `ENABLE_WEB_SOCKET` to `0`. |
+| `mbedtls_md5_starts_ret was not declared` in `WebAuthentication.cpp` | An old copy of ESPAsyncWebServer (such as 3.1.0) is installed, and it doesn't build on ESP32 core 3.x. Move it, and any old `AsyncTCP`, out of your `Arduino\libraries` folder, then install **ESP Async WebServer** and **Async TCP** by **ESP32Async** (see "Install the libraries"). |
 | The build stops with `Sketch too big` or `text section exceeds available space` | The web server makes the program bigger. Choose **Tools → Partition Scheme → Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)**, which keeps OTA working, or set `ENABLE_WEB_SOCKET` to `0`. |
 | The web page won't open, or its terminal stays empty | Use the IP address from the screen with `/esp` on the end, from a device on the same network. The terminal fills as packets arrive, so it stays empty until the OWL sends one. If the page looks unstyled, the browser has no internet access: it fetches its styling from public CDNs. |
 | `'otaPasswordHash' was not declared` | Your `config.h` is missing or out of date. Copy it again from `config.example.h` and fill it in. |
