@@ -12,7 +12,9 @@
 //  Needs config.h to provide:
 //    const char* ssid, password;
 //    const char* otaPasswordHash; // SHA-256 of your OTA password, 64 hex characters (if ENABLE_OTA)
-//    serverName, apiKeyValue      // only if ENABLE_HTTP_POST is 1
+//
+//  Only packets sent to the OWL multicast group are used, and a packet holding an
+//  impossible-looking value is thrown away whole (see "settings" below).
 // =============================================================================
 
 #include <WiFi.h>
@@ -25,13 +27,8 @@
 #include "config.h"
 
 // ------------------------------------------------------------------ options --
-#define ENABLE_HTTP_POST 0   // 1 = POST readings to serverName every POST_INTERVAL_MS
-#define ENABLE_OTA       1   // 1 = allow password-protected firmware updates over WiFi
-#define DEBUG_SERIAL     1   // 1 = print packets and parsed values to Serial (set 0 when deployed)
-
-#if ENABLE_HTTP_POST
-  #include <HTTPClient.h>
-#endif
+#define ENABLE_OTA   1       // 1 = allow password-protected firmware updates over WiFi
+#define DEBUG_SERIAL 1       // 1 = print packets and parsed values to Serial (set 0 when deployed)
 
 #if ENABLE_OTA
   #include <ArduinoOTA.h>
@@ -51,7 +48,14 @@ const int       METER_GHOST      = 45;                 // brightness (0-255) of 
 const uint32_t  STALE_AFTER_MS   = 180000UL;   // "No data since..." after this long without a packet
 const uint32_t  INFO_PAGE_MS     = 5000UL;     // how long each page of the bottom-left box shows
 const uint32_t  LISTEN_RETRY_MS  = 5000UL;     // retry joining the multicast group
-const uint32_t  POST_INTERVAL_MS = 180000UL;   // only used when ENABLE_HTTP_POST is 1
+
+// What counts as a believable reading. These are deliberately generous: they only exist so a
+// corrupt or forged packet can't put garbage on the screen. A packet with any value outside
+// them is thrown away whole (raise MAX_WATTS if you have an unusually big supply).
+const float MAX_WATTS      = 25000.0f;         // a 100 A single-phase supply is about 23 kW
+const float MAX_DAY_WH     = 600000.0f;        // MAX_WATTS for 24 hours
+const float MAX_COST_NOW_P = 5000.0f;          // pence per hour (GBP 50/hr)
+const float MAX_COST_DAY_P = 100000.0f;        // pence (GBP 1000)
 
 // OTA updates
 const char*  OTA_HOSTNAME         = "owl-display";   // shows up as owl-display.local / in the IDE port list
@@ -88,6 +92,12 @@ struct Readings {
 struct ValueField {
   int16_t y;         // text baseline
   char    shown[24]; // text currently on screen (so we only redraw on change)
+};
+
+enum class ParseResult {
+  NotElectricity,    // no electricity fields in the packet (e.g. a weather packet)
+  Accepted,          // fields found, all believable: `latest` was updated
+  Rejected           // a field held an impossible value: the whole packet was ignored
 };
 
 // ----------------------------------------------------------------- globals ---
@@ -449,48 +459,87 @@ bool extractText(const char* xml, const char* startTag, const char* endTag, char
  * @param xml       the packet text
  * @param startTag  text just before the number
  * @param endTag    text just after the number
- * @param out       receives the value; untouched if a tag is missing
+ * @param out       receives the value (NaN if the text between the tags isn't a number);
+ *                  untouched if a tag is missing
  * @return          true if both tags were found
  */
 bool extractFloat(const char* xml, const char* startTag, const char* endTag, float& out) {
   char tmp[24];
   if (!extractText(xml, startTag, endTag, tmp, sizeof tmp)) return false;
-  out = strtof(tmp, nullptr);
+  char* end = nullptr;
+  out = strtof(tmp, &end);
+  if (end == tmp) out = NAN;                   // no digits at all: don't pass a quiet 0 on
   return true;
 }
 
 /**
+ * Checks that a number is believable. NaN fails both comparisons and infinity is outside
+ * any limit, so neither can get through.
+ *
+ * @param v   the number
+ * @param lo  smallest acceptable value
+ * @param hi  largest acceptable value
+ * @return    true if v is between lo and hi (inclusive)
+ */
+bool inRange(float v, float lo, float hi) {
+  return v >= lo && v <= hi;
+}
+
+/**
+ * Logs why a packet was thrown away (debug builds only).
+ *
+ * @param field  name of the value that was out of range
+ * @return       always ParseResult::Rejected
+ */
+ParseResult rejectPacket(const char* field) {
+  (void)field;                                 // only used by the debug log
+  DBG("Ignored a packet: %s is not a believable value\n", field);
+  return ParseResult::Rejected;
+}
+
+/**
  * Updates `latest` from whichever electricity fields this packet contains. Fields that
- * aren't in the packet are left alone.
+ * aren't in the packet are left alone. All or nothing: if any field in the packet is not
+ * a believable number, `latest` is not changed at all.
  *
  * @param xml  the packet text
- * @return     true if the packet held at least one electricity field
+ * @return     Accepted if at least one field was found and all were believable,
+ *             Rejected if any field was out of range, NotElectricity if there were none
  */
-bool parseElectricity(const char* xml) {
+ParseResult parseElectricity(const char* xml) {
+  Readings next = latest;                      // only copied back once everything checks out
   bool found = false;
   float v;
 
   if (extractFloat(xml, "<curr units='w'>", "</curr>", v)) {
     found = true;
-    if (v > 0) latest.watts = v;               // the OWL occasionally reports 0, ignore it
+    if (!inRange(v, -MAX_WATTS, MAX_WATTS)) return rejectPacket("watts");
+    if (v > 0) next.watts = v;                 // the OWL occasionally reports 0, ignore it
   }
   if (extractFloat(xml, "<day units='wh'>", "</day>", v)) {
     found = true;
-    if (v > 0) latest.kwhToday = v / 1000.0f;
+    if (!inRange(v, -MAX_DAY_WH, MAX_DAY_WH)) return rejectPacket("today's usage");
+    if (v > 0) next.kwhToday = v / 1000.0f;
   }
   if (extractFloat(xml, "<battery level='", "'/>", v)) {
     found = true;
-    latest.battery = (int)v;
+    if (!inRange(v, 0.0f, 100.0f)) return rejectPacket("battery");
+    next.battery = (int)v;
   }
   if (extractFloat(xml, "</watts><cost>", "</cost></current>", v)) {
     found = true;
-    latest.costNow = v / 100.0f;               // pence -> pounds
+    if (!inRange(v, -MAX_COST_NOW_P, MAX_COST_NOW_P)) return rejectPacket("current cost");
+    next.costNow = v / 100.0f;                 // pence -> pounds
   }
   if (extractFloat(xml, "</wh><cost>", "</cost></day>", v)) {
     found = true;
-    latest.costToday = v / 100.0f;
+    if (!inRange(v, -MAX_COST_DAY_P, MAX_COST_DAY_P)) return rejectPacket("today's cost");
+    next.costToday = v / 100.0f;
   }
-  return found;
+
+  if (!found) return ParseResult::NotElectricity;
+  latest = next;
+  return ParseResult::Accepted;
 }
 
 #if DEBUG_SERIAL
@@ -504,6 +553,7 @@ void logWeather(const char* xml) {
   char  text[48];
   if (!extractFloat(xml, "code='", "'><temperature>", code)) return;
   if (!extractFloat(xml, "'><temperature>", "</temperature>", temp)) return;
+  if (!inRange(code, 0, 10000) || !inRange(temp, -10000, 10000)) return;   // keeps the (int) cast below well-defined
   if (!extractText(xml, "><text>", "</text></w", text, sizeof text)) text[0] = '\0';
   DBG("Weather code: %d  temperature: %.2f  text: %s\n", (int)code, temp / 100.0f, text);
 }
@@ -527,7 +577,10 @@ void recordPacketTime() {
  * WiFi goes away, and retries every LISTEN_RETRY_MS if joining fails. Call every loop.
  *
  * The packet handler runs on the UDP task, so it only copies the packet into a queue;
- * loop() does the parsing and drawing.
+ * loop() does the parsing and drawing. It drops anything that wasn't sent to the OWL
+ * multicast group: the socket is bound to the port on every address, so packets sent
+ * straight to this board (unicast or broadcast), or to some other group, would otherwise
+ * be accepted too.
  */
 void maintainListener() {
   static bool     listening = false;
@@ -550,6 +603,20 @@ void maintainListener() {
   if (udp.listenMulticast(OWL_GROUP, OWL_PORT)) {
     udp.onPacket([](AsyncUDPPacket packet) {
       static RxPacket rx;                      // only ever used by the UDP task
+
+      if (!packet.isMulticast() || packet.localIP() != OWL_GROUP) {
+#if DEBUG_SERIAL
+        static bool     noted    = false;      // log this at most once every 10 s, so a flood can't spam Serial
+        static uint32_t lastNote = 0;
+        if (!noted || millis() - lastNote > 10000UL) {
+          noted    = true;
+          lastNote = millis();
+          DBG("Ignored a packet not addressed to the OWL group (from %s)\n", packet.remoteIP().toString().c_str());
+        }
+#endif
+        return;
+      }
+
       size_t n = packet.length();
       if (n >= sizeof(rx.text)) n = sizeof(rx.text) - 1;
       memcpy(rx.text, packet.data(), n);
@@ -562,30 +629,6 @@ void maintainListener() {
     DBG("Could not join the multicast group, will retry\n");
   }
 }
-
-#if ENABLE_HTTP_POST
-/**
- * Sends the latest readings to serverName as a form POST. Blocks for up to 5 seconds.
- */
-void postReadings() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  HTTPClient http;
-  http.setTimeout(5000);
-  http.begin(serverName);
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  String body = String("api_key=") + apiKeyValue +
-                "&watts="   + String(latest.watts, 2) +
-                "&kwHours=" + String(latest.kwhToday, 2) +
-                "&nowCost=" + String(latest.costNow, 2) +
-                "&dayCost=" + String(latest.costToday, 2);
-  DBG("POST: watts=%.2f kWh=%.2f\n", latest.watts, latest.kwhToday);   // never log the body: it holds the API key
-  int code = http.POST(body);
-  DBG("POST response: %d\n", code);
-  (void)code;                                  // only used by the debug log
-  http.end();
-}
-#endif
 
 // --------------------------------------------------------------------- OTA ---
 #if ENABLE_OTA
@@ -766,7 +809,8 @@ void setup() {
 
 /**
  * Runs forever: services OTA, keeps the listener alive, handles any packets that have
- * arrived, refreshes the screen and (optionally) posts the readings.
+ * arrived and refreshes the screen. A packet that was rejected doesn't count as "heard
+ * from the OWL": it doesn't update the last-packet time or the stale-data timer.
  */
 void loop() {
 #if ENABLE_OTA
@@ -779,28 +823,24 @@ void loop() {
   bool changed = false;
   while (xQueueReceive(rxQueue, &rx, 0) == pdTRUE) {
     DBG("Packet: %s\n", rx.text);
-    if (parseElectricity(rx.text)) {
-      haveData = true;
-      recordPacketTime();
-      changed = true;
-    }
+    switch (parseElectricity(rx.text)) {
+      case ParseResult::Accepted:
+        haveData = true;
+        recordPacketTime();
+        changed = true;
+        break;
+      case ParseResult::NotElectricity:
 #if DEBUG_SERIAL
-    else {
-      logWeather(rx.text);
-    }
+        logWeather(rx.text);
 #endif
+        break;
+      case ParseResult::Rejected:              // already logged by parseElectricity
+        break;
+    }
   }
 
   if (changed) updateDisplay();
   if (haveData) updateInfoBox();
-
-#if ENABLE_HTTP_POST
-  static uint32_t lastPostMs = 0;
-  if (haveData && millis() - lastPostMs >= POST_INTERVAL_MS) {
-    lastPostMs = millis();
-    postReadings();
-  }
-#endif
 
   delay(20);
 }
