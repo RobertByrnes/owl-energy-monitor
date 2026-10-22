@@ -36,7 +36,7 @@
   // Kept above colours.h, which #defines names such as RED and BLUE that library code could trip over.
   #include <ESPAsyncWebServer.h>   // "ESP Async WebServer" by ESP32Async
   #include <ESPSocket.h>           // esp_socket: https://github.com/RobertByrnes/esp_socket
-  #include <SHA256Builder.h>       // part of the "Hash" library, to check the web console password
+  #include <SHA2Builder.h>         // part of the "Hash" library, to check the web console password
   #include "mbedtls/base64.h"      // to decode the browser's HTTP Basic Auth header
   #include "web_console_page.h"    // this project's copy of esp_socket's page, Update/Provision removed
 #endif
