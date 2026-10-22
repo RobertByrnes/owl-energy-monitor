@@ -11,11 +11,15 @@
 //
 //  Optional live web console (ENABLE_WEB_SOCKET), built on the esp_socket library
 //  (https://github.com/RobertByrnes/esp_socket): browse to http://<ip>/esp to watch the
-//  readings arrive. It is read-only; anything a browser sends is ignored.
+//  readings arrive, and send Runtime or Reboot. One password protects both the page and
+//  the websocket: the same one as OTA (otaPasswordHash). Update and Provision, two actions
+//  esp_socket's page normally offers, are left out of this project's own copy of the page
+//  (web_console_page.h) and aren't handled -- this project doesn't implement them.
 //
 //  Needs config.h to provide:
 //    const char* ssid, password;
-//    const char* otaPasswordHash; // SHA-256 of your OTA password, 64 hex characters (if ENABLE_OTA)
+//    const char* otaPasswordHash; // SHA-256 of your device password, 64 hex characters -- used
+//                                 // by OTA (if ENABLE_OTA) and the web console (if ENABLE_WEB_SOCKET)
 //
 //  Only packets sent to the OWL multicast group are used, and a packet holding an
 //  impossible-looking value is thrown away whole (see "settings" below).
@@ -23,7 +27,7 @@
 
 // ------------------------------------------------------------------ options --
 #define ENABLE_OTA        1  // 1 = allow password-protected firmware updates over WiFi
-#define ENABLE_WEB_SOCKET 1  // 1 = serve a read-only live web console at http://<ip>/esp (needs the extra libraries in the README)
+#define ENABLE_WEB_SOCKET 1  // 1 = serve a password-protected live web console at http://<ip>/esp (needs the extra libraries in the README)
 #define DEBUG_SERIAL      1  // 1 = print packets and parsed values to Serial (set 0 when deployed)
 
 #include <WiFi.h>
@@ -32,6 +36,9 @@
   // Kept above colours.h, which #defines names such as RED and BLUE that library code could trip over.
   #include <ESPAsyncWebServer.h>   // "ESP Async WebServer" by ESP32Async
   #include <ESPSocket.h>           // esp_socket: https://github.com/RobertByrnes/esp_socket
+  #include <SHA256Builder.h>       // part of the "Hash" library, to check the web console password
+  #include "mbedtls/base64.h"      // to decode the browser's HTTP Basic Auth header
+  #include "web_console_page.h"    // this project's copy of esp_socket's page, Update/Provision removed
 #endif
 #include <Adafruit_GFX.h>
 #include <MCUFRIEND_kbv.h>
@@ -143,6 +150,7 @@ unsigned   otaLastPercent = 101;               // last progress value drawn (101
 #if ENABLE_WEB_SOCKET
 AsyncWebServer webServer(80);                  // serves the esp_socket page and its websocket
 bool           webReady = false;               // true once the web console has been started
+AsyncAuthenticationMiddleware webAuth;         // gates the page and the websocket with otaPasswordHash
 #endif
 
 // ------------------------------------------------------------ text helpers ---
@@ -655,6 +663,45 @@ void maintainListener() {
   }
 }
 
+// ------------------------------------------------------- shared password hash ---
+#if ENABLE_OTA || ENABLE_WEB_SOCKET
+
+// SHA-256 of the empty string, i.e. "no password at all" -- rejected below so the board
+// can never be left open to anyone on the network just because config.h was left blank.
+const char* EMPTY_PASSWORD_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/**
+ * Checks that a string is a SHA-256 hash written as 64 hex characters.
+ *
+ * @param s  the string to check (may be nullptr)
+ * @return   true if it is exactly 64 hex digits
+ */
+bool isSha256Hex(const char* s) {
+  if (s == nullptr || strlen(s) != 64) return false;
+  for (int i = 0; i < 64; i++) {
+    if (!isxdigit((unsigned char)s[i])) return false;
+  }
+  return true;
+}
+
+/**
+ * Checks that otaPasswordHash in config.h is safe to actually use: a well-formed SHA-256
+ * hash, and not the hash of an empty password. Used to decide whether to start OTA and/or
+ * the web console -- both share the one device password, so both share this gate.
+ *
+ * @param raw    otaPasswordHash as read from config.h, any case
+ * @param lower  receives it lowercased, as ArduinoOTA needs it (buffer of at least 65 bytes)
+ * @return       true if raw is usable as a real password hash
+ */
+bool isUsablePasswordHash(const char* raw, char* lower) {
+  if (!isSha256Hex(raw)) return false;
+  for (int i = 0; i < 64; i++) lower[i] = tolower((unsigned char)raw[i]);
+  lower[64] = '\0';
+  return strcmp(lower, EMPTY_PASSWORD_HASH) != 0;
+}
+
+#endif  // ENABLE_OTA || ENABLE_WEB_SOCKET
+
 // --------------------------------------------------------------------- OTA ---
 #if ENABLE_OTA
 
@@ -738,38 +785,15 @@ void otaError(ota_error_t error) {
 }
 
 /**
- * Checks that a string is a SHA-256 hash written as 64 hex characters.
- *
- * @param s  the string to check (may be nullptr)
- * @return   true if it is exactly 64 hex digits
- */
-bool isSha256Hex(const char* s) {
-  if (s == nullptr || strlen(s) != 64) return false;
-  for (int i = 0; i < 64; i++) {
-    if (!isxdigit((unsigned char)s[i])) return false;
-  }
-  return true;
-}
-
-/**
  * Starts OTA updates. config.h holds only the SHA-256 hash of the OTA password
  * (otaPasswordHash); you type the real password into the Arduino IDE when you upload.
  * OTA stays off if the hash is missing, malformed, or the hash of an empty password, so
  * the board can never be left open to anyone on the network.
  */
 void setupOTA() {
-  // SHA-256 of the empty string, i.e. "no password at all"
-  const char* EMPTY_PASSWORD_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-  if (!isSha256Hex(otaPasswordHash)) {
-    Serial.println("OTA disabled: otaPasswordHash in config.h must be the 64-character SHA-256 hex of your OTA password");
-    return;
-  }
   char hash[65];                               // the OTA library needs lower case hex
-  for (int i = 0; i < 64; i++) hash[i] = tolower((unsigned char)otaPasswordHash[i]);
-  hash[64] = '\0';
-  if (strcmp(hash, EMPTY_PASSWORD_HASH) == 0) {
-    Serial.println("OTA disabled: otaPasswordHash is the hash of an empty password");
+  if (!isUsablePasswordHash(otaPasswordHash, hash)) {
+    Serial.println("OTA disabled: otaPasswordHash in config.h must be the 64-character SHA-256 hex of your OTA password, and not of an empty one");
     return;
   }
 
@@ -790,21 +814,116 @@ void setupOTA() {
 #if ENABLE_WEB_SOCKET
 
 /**
- * Starts the live web console, which is the esp_socket library. Browse to http://<ip>/esp
- * (the IP is on the screen) to watch the readings arrive; the page talks to the board over
- * a websocket at /ws.
+ * Computes the SHA-256 hash of a password as 64 lowercase hex characters, the same form
+ * otaPasswordHash is written in.
  *
- * It is read-only: esp_socket is given no message handler, so anything a browser sends is
- * ignored. There is no password, so it is meant for a network you trust (see the README).
+ * @param text  the password to hash
+ * @param out   receives the hash, as text (buffer of at least 65 bytes, NUL included)
+ */
+void sha256Hex(const char* text, char* out) {
+  SHA256Builder sha;
+  sha.begin();
+  sha.add((const uint8_t*)text, strlen(text));
+  sha.calculate();
+  sha.getChars(out);
+}
+
+/**
+ * Checks a browser's HTTP Basic Auth credentials against otaPasswordHash. The same
+ * password that unlocks OTA unlocks the web console, and only its hash is ever kept on
+ * the device; the username the browser sends along with it is never checked. Passed to
+ * webAuth.setAuthentificationFunction() -- see setupWebConsole().
+ *
+ * @param request  the incoming request
+ * @return         true if the typed password's SHA-256 matches otaPasswordHash
+ */
+bool checkWebPassword(AsyncWebServerRequest* request) {
+  if (request->authType() != AsyncAuthType::AUTH_BASIC) return false;
+
+  String encoded = request->authChallenge();     // base64("username:password"), "Basic " already stripped
+  if (encoded.length() == 0) return false;
+
+  uint8_t decoded[256];
+  size_t  decodedLen = 0;
+  if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &decodedLen,
+                             (const unsigned char*)encoded.c_str(), encoded.length()) != 0) {
+    return false;                                 // malformed, or too long to be a real password
+  }
+  decoded[decodedLen] = '\0';
+
+  char* colon = strchr((char*)decoded, ':');
+  if (colon == nullptr) return false;             // not "username:password"
+
+  char hash[65];
+  sha256Hex(colon + 1, hash);
+  return strcasecmp(hash, otaPasswordHash) == 0;
+}
+
+/**
+ * Handles an action sent from the web console's dropdown (plain text, over the
+ * websocket). Runtime and Reboot are implemented. Update and Provision -- two actions
+ * esp_socket's page normally offers -- are left out of this project's own copy of the
+ * page (web_console_page.h) and are refused here too, in case anyone sends them by hand.
+ *
+ * @param data  the bytes received (not null-terminated)
+ * @param len   how many bytes were received
+ */
+void handleSocketMessage(uint8_t* data, size_t len) {
+  String action;
+  for (size_t i = 0; i < len; i++) action += (char)data[i];
+  action.trim();
+  if (action.length() == 0) return;
+
+  if (action == "runtime") {
+    uint32_t upSec = millis() / 1000;
+    ESPSocket.printf("Uptime %lu:%02lu:%02lu | Free heap %u bytes | WiFi RSSI %d dBm",
+                      (unsigned long)(upSec / 3600), (unsigned long)((upSec / 60) % 60), (unsigned long)(upSec % 60),
+                      (unsigned)ESP.getFreeHeap(), WiFi.RSSI());
+  } else if (action == "reboot") {
+    ESPSocket.println("Rebooting now...");
+    ESPSocket.println("[:RELOAD:]");             // esp_socket's own page reloads on seeing this
+    delay(300);                                   // give the websocket frames time to actually go out
+    ESP.restart();
+  } else {
+    ESPSocket.printf("'%s' is not available on this device", action.c_str());
+  }
+}
+
+/**
+ * Starts the live web console, which is the esp_socket library with a project-local page
+ * (web_console_page.h). Browse to http://<ip>/esp (the IP is on the screen) and log in
+ * with the device password -- the same one OTA uses -- to watch readings arrive and send
+ * Runtime or Reboot (handleSocketMessage()). webAuth is attached to the whole server, so
+ * it covers every request, including the websocket at /ws, not just the page itself.
+ *
+ * Stays off if otaPasswordHash is missing, malformed, or the hash of an empty password --
+ * same rule as OTA, so the console can never be left open to anyone on the network.
  */
 void setupWebConsole() {
+  char hash[65];
+  if (!isUsablePasswordHash(otaPasswordHash, hash)) {
+    Serial.println("Web console disabled: otaPasswordHash in config.h must be the 64-character SHA-256 hex of your device password, and not of an empty one");
+    return;
+  }
+
+  webAuth.setUsername("owl");          // the browser's username is never checked -- see checkWebPassword()
+  webAuth.setPassword("ignored");      // placeholder so AsyncAuthenticationMiddleware arms itself
+  webAuth.setAuthType(AsyncAuthType::AUTH_BASIC);
+  webAuth.setRealm("OWL energy monitor");
+  webAuth.setAuthentificationFunction(checkWebPassword);
+  webServer.addMiddleware(&webAuth);   // every request needs the device password, /ws included
+
   webServer.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
-    request->redirect("/esp");                 // so http://<ip>/ finds the page too
+    request->redirect("/esp");                   // so http://<ip>/ finds the page too
   });
-  ESPSocket.begin(&webServer);                 // page at /esp, websocket at /ws
+  webServer.on("/esp", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", (const uint8_t*)owl_web_console_html, owl_web_console_html_len);
+  });
+  ESPSocket.begin(&webServer, 0, "/esp-builtin");  // unused page; only /ws (protected above) matters here
+  ESPSocket.msgCallback(handleSocketMessage);      // Runtime and Reboot; anything else is refused
   webServer.begin();
   webReady = true;
-  Serial.printf("Web console ready: http://%s/esp\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Web console ready: http://%s/esp (password required)\n", WiFi.localIP().toString().c_str());
 }
 
 /**
