@@ -31,8 +31,9 @@ home network and shows what your house is using right now.
   and it shows `WIFI LOST` if the connection drops.
 - **Updates over WiFi (OTA):** password protected, with a progress bar on the screen.
 - **Live web console (optional):** browse to `http://<the display's IP>/esp` to watch each reading
-  arrive on a web page. It's built on the [esp_socket](https://github.com/RobertByrnes/esp_socket)
-  library and is read-only (see "Live web console" below).
+  arrive on a web page, and send it Runtime or Reboot. It's built on the
+  [esp_socket](https://github.com/RobertByrnes/esp_socket) library, and the same password as OTA
+  protects it (see "Live web console" below).
 - **Safe by default:** only packets sent to the OWL's multicast group are used, and a packet with an
   impossible-looking value is ignored whole (see "How it works").
 
@@ -61,9 +62,12 @@ OWL_Display/
 ├── README_HTTP_POST.md         optional extra: send the readings to your own server
 ├── .gitignore                  keeps config.h, backups and keys out of git
 ├── config.example.h            template for your private settings
+├── scripts/
+│   └── gen_web_console_page.py regenerates web_console_page.h (see its own comment)
 └── owl_energy_display/         the Arduino sketch
     ├── owl_energy_display.ino  the program
     ├── colours.h               colour constants (see "Screen colours")
+    ├── web_console_page.h      this project's copy of esp_socket's page (see "Live web console")
     └── config.h                YOUR settings: you create this, git ignores it
 ```
 
@@ -129,24 +133,26 @@ cp config.example.h owl_energy_display/config.h          (macOS / Linux)
 | Setting | Meaning |
 |---------|---------|
 | `ssid`, `password` | Your 2.4 GHz WiFi name and password. |
-| `otaPasswordHash` | The **SHA-256 hash** of your OTA password (64 hex characters), not the password itself. See "Making the OTA password hash" below. If it is missing or malformed, OTA stays switched off and Serial says why. |
+| `otaPasswordHash` | The **SHA-256 hash** of your device password (64 hex characters), not the password itself. One password for the whole device: it covers both OTA and the web console (if `ENABLE_WEB_SOCKET`). See "Making the device password hash" below. If it is missing or malformed, both stay switched off and Serial says why. |
 
 Older versions of the sketch also read `serverName` and `apiKeyValue` from this file. Nothing uses
 them any more, so you can delete them from an old `config.h`.
 
-#### Making the OTA password hash
+#### Making the device password hash
 
-`config.h` stores only a hash of the password you use to update over WiFi, so the password
-itself never sits in a file, in git or in a synced folder. Pick a long, random password
-(16 or more characters; a password manager's generator is ideal), then turn it into its hash.
-This asks for the password without showing it:
+`config.h` stores only a hash of your device password -- the one password that covers both
+updating over WiFi and logging into the web console -- so the password itself never sits in a
+file, in git or in a synced folder. Pick a long, random password (16 or more characters; a
+password manager's generator is ideal), then turn it into its hash. This asks for the password
+without showing it:
 
 ```
 python -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass().encode()).hexdigest())"
 ```
 
 Paste the 64-character result into `otaPasswordHash` in `config.h`, and keep the real password in
-your password manager, because the Arduino IDE asks for it when you upload over WiFi. (On Windows
+your password manager: the Arduino IDE asks for it when you upload over WiFi, and the web console
+asks for it too (username doesn't matter -- leave it blank or type anything). (On Windows
 use `py` instead of `python` if `python` isn't found.) With no Python, PowerShell can do it, but it
 shows what you type, so clear the screen afterwards:
 
@@ -192,14 +198,17 @@ traffic (client isolation) and that mDNS is allowed. As a fallback, use USB.
 ## Live web console (esp_socket)
 
 With `ENABLE_WEB_SOCKET` on (the default), the board also runs a small web server, using the
-[esp_socket](https://github.com/RobertByrnes/esp_socket) library.
+[esp_socket](https://github.com/RobertByrnes/esp_socket) library with this project's own copy of
+its page (`owl_energy_display/web_console_page.h`).
 
 1. Find the board's IP address. It's on the screen, in the bottom-left box (which alternates
    with the time of the last packet).
 2. On a phone or PC on the same network, open `http://<that IP>/esp`. Plain `http://<that IP>/`
    redirects there too. With OTA on, `http://owl-display.local/esp` also works on systems that
    support mDNS.
-3. Each reading the OWL sends adds a line to the terminal:
+3. The browser asks for a username and password. Type anything as the username (it isn't
+   checked) and your device password (the one `otaPasswordHash` is the hash of) as the password.
+4. Each reading the OWL sends adds a line to the terminal:
    ```
    1234 W | 5.68 kWh today | 1.23 GBP today | 0.28 GBP/hr | OWL battery 85 %
    ```
@@ -207,10 +216,16 @@ With `ENABLE_WEB_SOCKET` on (the default), the board also runs a small web serve
    and fills as packets arrive. The boxes above it show the WiFi signal, the chip and the OWL
    sensor's battery, and refresh every 10 seconds.
 
-It is read-only. The page still has the Send button and action list from esp_socket's general
-purpose page, but the sketch gives esp_socket no message handler, so anything a browser sends is
-ignored. The page loads Bootstrap, Google Fonts and Font Awesome from public CDNs, so the browser
-needs internet access for the page to look right. The board itself doesn't need the internet for this.
+The dropdown's **Runtime** and **Reboot** actions work: Runtime prints uptime, free heap and WiFi
+signal; Reboot restarts the board (the page reloads itself a few seconds later). **Update** and
+**Provision**, two actions esp_socket's own page normally offers, are left out of this project's
+copy of the page -- neither is implemented here, and leaving them visible invited trying them.
+
+One password protects the whole thing -- the page and the websocket both need it, the same one as
+OTA -- so unlike earlier versions of this project, the console can no longer be opened by anyone
+on your network without it. The page loads Bootstrap, Google Fonts and Font Awesome from public
+CDNs, so the browser needs internet access for the page to look right. The board itself doesn't
+need the internet for this.
 
 ## Settings in the sketch
 
@@ -219,7 +234,7 @@ The options at the top of `owl_energy_display.ino` are the ones you'll most like
 | Setting | Default | What it does |
 |---------|---------|--------------|
 | `ENABLE_OTA` | `1` | Allow password-protected updates over WiFi. |
-| `ENABLE_WEB_SOCKET` | `1` | Serve the read-only live web console (see above). Set to `0` to leave out the web server and the extra libraries. |
+| `ENABLE_WEB_SOCKET` | `1` | Serve the password-protected live web console (see above). Set to `0` to leave out the web server and the extra libraries. |
 | `DEBUG_SERIAL` | `1` | Print every packet and parsed value to Serial. Set to `0` once it's working. |
 | `MAX_WATTS` and the other `MAX_` limits | 25,000 W, 600,000 Wh, £50/hr, £1,000/day | The biggest readings the sketch believes. A packet with anything beyond them is ignored. They are generous on purpose; raise `MAX_WATTS` if your supply really is bigger than about 23 kW. |
 | `METER_MAX_WATTS` | `3500` | Full scale of the dial. Lower it to make the dial go red sooner. |
@@ -264,8 +279,9 @@ send `~colour565`.
 | The build stops with `Sketch too big` or `text section exceeds available space` | The web server makes the program bigger. Choose **Tools → Partition Scheme → Minimal SPIFFS (1.9MB APP with OTA/190KB SPIFFS)**, which keeps OTA working, or set `ENABLE_WEB_SOCKET` to `0`. |
 | The web page won't open, or its terminal stays empty | Use the IP address from the screen with `/esp` on the end, from a device on the same network. The terminal fills as packets arrive, so it stays empty until the OWL sends one. If the page looks unstyled, the browser has no internet access: it fetches its styling from public CDNs. |
 | `'otaPasswordHash' was not declared` | Your `config.h` is missing or out of date. Copy it again from `config.example.h` and fill it in. |
-| Serial says `OTA disabled: otaPasswordHash ...` | The value must be exactly 64 hex characters, the SHA-256 of your password, and not the hash of an empty password. |
+| Serial says `OTA disabled: otaPasswordHash ...` or `Web console disabled: otaPasswordHash ...` | The value must be exactly 64 hex characters, the SHA-256 of your password, and not the hash of an empty password. Both OTA and the web console use it, so a bad hash switches both off. |
 | The IDE says the OTA password is wrong | Type the original password, not the hash. If it still fails, remake the hash and check the password had no stray space or newline. |
+| The web page asks for a login and won't accept the right password | The username doesn't matter, but the password has to be the real one, not the hash from `config.h`. If it still won't accept it, remake the hash (see "Making the device password hash") and check for a stray space or newline. |
 | Errors about `ArduinoOTA`, such as `setHostname`, or the build says it is using `Documents\Arduino\libraries\ArduinoOTA` | That folder is a different library, for SAMD and Uno R4 boards, and it is hiding the ESP32 one. Move it aside for ESP32 builds. |
 | Stays on "Waiting for the OWL to Hoot!" | No packets are arriving. Check the OWL is sending multicast packets on the same network and subnet as the ESP32. Some routers and access points block or throttle multicast (look for IGMP snooping or multicast settings). Serial should show `Listening for OWL packets`. |
 | Bottom-left box says `No data since…` | Nothing has been heard for 3 minutes. Check the OWL and its sensor battery. Serial may say why: see the next two rows. |
@@ -280,16 +296,21 @@ send `~colour565`.
   `config.example.h`, plus `*.bak`, `*.orig`, `*.pem` and `*.key`, so a stray backup or key file
   can't be added by accident. If your sketchbook lives in OneDrive or Dropbox, `config.h` will
   sync there too.
-- `config.h` keeps only a **hash** of the OTA password. Treat the hash as secret too: with this
+- `config.h` keeps only a **hash** of the device password. Treat the hash as secret too: with this
   login scheme, anyone who has the hash could write a tool that logs in. The WiFi password still
   has to be plain text in `config.h` because the board needs it exactly as it is.
-- Use a long, random OTA password. Updates are password protected but not encrypted or signed,
-  so anyone who has the password (or the hash) and is on your network can load new firmware.
-  Don't forward the OTA port to the internet.
-- The live web console has **no password** and uses plain HTTP, so anyone on your network can open
-  it and see your electricity use, which shows when you are home. It is read-only and can't change
-  anything on the board, and the sketch only sends numbers and fixed text to it, never text from a
-  packet. Don't forward port 80 to the internet. Set `ENABLE_WEB_SOCKET` to `0` if you don't want it.
+- Use a long, random device password. OTA and the web console are password protected but not
+  encrypted (plain HTTP, no TLS), so anyone who has the password (or the hash) and is on your
+  network, or who can read the traffic on it, can get in. Don't forward the OTA port or port 80
+  to the internet.
+- The live web console needs that same password to open the page or use its websocket, so anyone
+  without it can no longer see your electricity use (which shows when you are home) or send it
+  commands. Logged in, Reboot really does restart the board, so the password is the only thing
+  standing between a visitor and that. Update and Provision -- esp_socket's own actions for
+  flashing new firmware and Wifi setup over the web page -- are left out of this project's page and
+  refused if sent anyway (see "Live web console"), so logging in can't be used to load new firmware
+  or change WiFi settings, only to watch readings, check on the board, or restart it. Set
+  `ENABLE_WEB_SOCKET` to `0` if you don't want the console at all.
 - The board only accepts packets sent to the OWL's multicast group, and ignores any packet with a
   value that isn't a believable number. That stops packets aimed straight at the board, and garbage
   values, from reaching the screen.
