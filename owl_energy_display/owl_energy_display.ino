@@ -9,6 +9,10 @@
 //
 //  Updates over WiFi (OTA), protected by a password.
 //
+//  Optional live web console (ENABLE_WEB_SOCKET), built on the esp_socket library
+//  (https://github.com/RobertByrnes/esp_socket): browse to http://<ip>/esp to watch the
+//  readings arrive. It is read-only; anything a browser sends is ignored.
+//
 //  Needs config.h to provide:
 //    const char* ssid, password;
 //    const char* otaPasswordHash; // SHA-256 of your OTA password, 64 hex characters (if ENABLE_OTA)
@@ -17,18 +21,24 @@
 //  impossible-looking value is thrown away whole (see "settings" below).
 // =============================================================================
 
+// ------------------------------------------------------------------ options --
+#define ENABLE_OTA        1  // 1 = allow password-protected firmware updates over WiFi
+#define ENABLE_WEB_SOCKET 1  // 1 = serve a read-only live web console at http://<ip>/esp (needs the extra libraries in the README)
+#define DEBUG_SERIAL      1  // 1 = print packets and parsed values to Serial (set 0 when deployed)
+
 #include <WiFi.h>
 #include <AsyncUDP.h>
+#if ENABLE_WEB_SOCKET
+  // Kept above colours.h, which #defines names such as RED and BLUE that library code could trip over.
+  #include <ESPAsyncWebServer.h>   // "ESP Async WebServer" by ESP32Async
+  #include <ESPSocket.h>           // esp_socket: https://github.com/RobertByrnes/esp_socket
+#endif
 #include <Adafruit_GFX.h>
 #include <MCUFRIEND_kbv.h>
 #include <Fonts/FreeSans9pt7b.h>
 #include "FreeDefaultFonts.h"
 #include "colours.h"
 #include "config.h"
-
-// ------------------------------------------------------------------ options --
-#define ENABLE_OTA   1       // 1 = allow password-protected firmware updates over WiFi
-#define DEBUG_SERIAL 1       // 1 = print packets and parsed values to Serial (set 0 when deployed)
 
 #if ENABLE_OTA
   #include <ArduinoOTA.h>
@@ -40,6 +50,15 @@
   #define DBG(...) ((void)0)
 #endif
 
+// Writes one line to every browser watching the web console (if it is running). Call it from
+// loop() only, and only with numbers and fixed text, never text that came from a packet:
+// the web page shows some message types as HTML.
+#if ENABLE_WEB_SOCKET
+  #define WEB(...) do { if (webReady) ESPSocket.printf(__VA_ARGS__); } while (0)
+#else
+  #define WEB(...) ((void)0)
+#endif
+
 // ----------------------------------------------------------------- settings --
 const IPAddress OWL_GROUP(224, 192, 32, 19);   // OWL multicast group
 const uint16_t  OWL_PORT         = 22600;
@@ -48,6 +67,7 @@ const int       METER_GHOST      = 45;                 // brightness (0-255) of 
 const uint32_t  STALE_AFTER_MS   = 180000UL;   // "No data since..." after this long without a packet
 const uint32_t  INFO_PAGE_MS     = 5000UL;     // how long each page of the bottom-left box shows
 const uint32_t  LISTEN_RETRY_MS  = 5000UL;     // retry joining the multicast group
+const uint32_t  WEB_STATUS_MS    = 10000UL;    // how often the web console's WiFi / chip / battery boxes refresh
 
 // What counts as a believable reading. These are deliberately generous: they only exist so a
 // corrupt or forged packet can't put garbage on the screen. A packet with any value outside
@@ -120,6 +140,10 @@ int        shownWatts = -1;
 int        meterAngle = METER_UNDRAWN;         // angle the ring is currently drawn to
 bool       otaEnabled = false;                 // true once OTA has been started
 unsigned   otaLastPercent = 101;               // last progress value drawn (101 = none yet)
+#if ENABLE_WEB_SOCKET
+AsyncWebServer webServer(80);                  // serves the esp_socket page and its websocket
+bool           webReady = false;               // true once the web console has been started
+#endif
 
 // ------------------------------------------------------------ text helpers ---
 
@@ -486,14 +510,15 @@ bool inRange(float v, float lo, float hi) {
 }
 
 /**
- * Logs why a packet was thrown away (debug builds only).
+ * Logs why a packet was thrown away (to Serial in debug builds, and to the web console).
  *
  * @param field  name of the value that was out of range
  * @return       always ParseResult::Rejected
  */
 ParseResult rejectPacket(const char* field) {
-  (void)field;                                 // only used by the debug log
+  (void)field;                                 // only used by the logs
   DBG("Ignored a packet: %s is not a believable value\n", field);
+  WEB("Ignored a packet: %s is not a believable value", field);
   return ParseResult::Rejected;
 }
 
@@ -761,11 +786,59 @@ void setupOTA() {
 
 #endif  // ENABLE_OTA
 
+// ------------------------------------------------------------- web console ---
+#if ENABLE_WEB_SOCKET
+
+/**
+ * Starts the live web console, which is the esp_socket library. Browse to http://<ip>/esp
+ * (the IP is on the screen) to watch the readings arrive; the page talks to the board over
+ * a websocket at /ws.
+ *
+ * It is read-only: esp_socket is given no message handler, so anything a browser sends is
+ * ignored. There is no password, so it is meant for a network you trust (see the README).
+ */
+void setupWebConsole() {
+  webServer.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->redirect("/esp");                 // so http://<ip>/ finds the page too
+  });
+  ESPSocket.begin(&webServer);                 // page at /esp, websocket at /ws
+  webServer.begin();
+  webReady = true;
+  Serial.printf("Web console ready: http://%s/esp\n", WiFi.localIP().toString().c_str());
+}
+
+/**
+ * Writes the latest readings to the web console: one line per accepted packet.
+ */
+void logReadingsToWeb() {
+  WEB("%.0f W | %.2f kWh today | %.2f GBP today | %.2f GBP/hr | OWL battery %d %%",
+      latest.watts, latest.kwhToday, latest.costToday, latest.costNow, latest.battery);
+}
+
+/**
+ * Every WEB_STATUS_MS, refreshes the three boxes above the terminal on the web page: WiFi
+ * signal, chip details and the OWL sensor's battery. A page opened later fills them in
+ * within one interval. Call every loop.
+ */
+void updateWebStatus() {
+  static uint32_t last = 0;
+  if (!webReady || millis() - last < WEB_STATUS_MS) return;
+  last = millis();
+
+  ESPSocket.printWiFiInfo();                   // WiFi box
+  ESPSocket.printESPInfo();                    // chip box
+  if (latest.battery > 0) {                    // battery box: the OWL sensor's, not the board's
+    ESPSocket.printf("[:BATT:]OWL sensor battery: %d %%", latest.battery);
+  }
+}
+
+#endif  // ENABLE_WEB_SOCKET
+
 // ------------------------------------------------------------------- setup ---
 
 /**
  * Runs once at boot: starts the screen, connects to WiFi (restarting if it can't),
- * starts the clock and OTA, and shows the "waiting" screen.
+ * starts the clock, OTA and the web console, and shows the "waiting" screen.
  */
 void setup() {
   Serial.begin(115200);
@@ -803,14 +876,18 @@ void setup() {
 #if ENABLE_OTA
   setupOTA();
 #endif
+#if ENABLE_WEB_SOCKET
+  setupWebConsole();
+#endif
 }
 
 // -------------------------------------------------------------------- loop ---
 
 /**
  * Runs forever: services OTA, keeps the listener alive, handles any packets that have
- * arrived and refreshes the screen. A packet that was rejected doesn't count as "heard
- * from the OWL": it doesn't update the last-packet time or the stale-data timer.
+ * arrived, refreshes the screen and feeds the web console. A packet that was rejected
+ * doesn't count as "heard from the OWL": it doesn't update the last-packet time or the
+ * stale-data timer.
  */
 void loop() {
 #if ENABLE_OTA
@@ -828,6 +905,9 @@ void loop() {
         haveData = true;
         recordPacketTime();
         changed = true;
+#if ENABLE_WEB_SOCKET
+        logReadingsToWeb();
+#endif
         break;
       case ParseResult::NotElectricity:
 #if DEBUG_SERIAL
@@ -841,6 +921,9 @@ void loop() {
 
   if (changed) updateDisplay();
   if (haveData) updateInfoBox();
+#if ENABLE_WEB_SOCKET
+  updateWebStatus();
+#endif
 
   delay(20);
 }
